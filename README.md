@@ -1,0 +1,230 @@
+# MA8 — ES7210 ×2 8ch 同時サンプリング レコーダー（ESP32-S3 / ESP32-P4）
+
+ES7210（4ch オーディオADC）を2個使い、**8ch を同時サンプリング**します。取得したデータは次の4通りで取り出せます。
+
+| 出力モード | 内容 |
+|---|---|
+| **SD** | microSD に 8ch WAV で保存（`/MA8/R0001_00.WAV` …） |
+| **SERIAL** | USB-CDC でバイナリパケットを送信。PC側は [tools/ma8_serial_rx.py](tools/ma8_serial_rx.py) で受信して WAV に保存 |
+| **USB AUDIO** | 8ch マイクとして認識される（Windows/macOS/Linux 標準ドライバ、Audacity などで録音）。StampS3 は UAC1（Full-Speed）、Stamp-P4 は UAC2（High-Speed） |
+| **UART DBG** | デバッグ用。4ch を約 1kHz に間引き、テキスト（CSV）でハードウェア UART へ出力（921600bps） |
+
+対応モジュールは2種類です。
+
+| | **M5Stack Stamp-P4**（本命） | **M5StampS3**（M5Capsule 内） |
+|---|---|---|
+| MCU | ESP32-P4（PSRAM 32MB） | ESP32-S3（PSRAM なし） |
+| フレームワーク | Arduino 3.x（pioarduino、IDF 5.5） | Arduino 2.0.17（espressif32@6.13.0、IDF 4.4） |
+| USB Audio | UAC2 / High-Speed：**8ch・48kHz・32bit まで** | UAC1 / Full-Speed：8ch・16bit・38kHz まで |
+| SD | 外付け microSD（SDMMC 4bit） | M5Capsule 内蔵スロット（SPI） |
+| 操作 | USB シリアルのコマンド | ボタン＋LED、USB シリアルのコマンド |
+| プロジェクト | [p4/platformio.ini](p4/platformio.ini) | [platformio.ini](platformio.ini) |
+
+サンプリングレートとビット数は [include/config.h](include/config.h) の `SAMPLE_RATE_HZ` / `SAMPLE_BITS` で設定します（`-D` で platformio.ini から上書きも可）。
+
+## ビルド
+
+```
+# Stamp-P4（初回は pioarduino 一式を ~/.platformio-pioarduino にダウンロードします）
+pio run -d p4 -t upload                 # チップ rev v3.0 未満（既定）
+pio run -d p4 -e stamp-p4-r3 -t upload  # チップ rev v3.x
+pio device monitor -d p4
+
+# StampS3
+pio run -e m5stamps3 -t upload
+pio device monitor
+```
+
+- **Stamp-P4 は別プロジェクト（`p4/`）です。** ソースは共通（`src_dir = ../src`）で、`src/p4/` と `src/s3/` をビルド対象で切り替えます。
+- `p4/platformio.ini` は `core_dir = ~/.platformio-pioarduino` を使います。pioarduino は自分用の PlatformIO フォークを core の Python 環境に入れ、共有パッケージも置き換えるため、通常の `~/.platformio`（StampS3 や他のプロジェクトが使う環境）から切り離しています。
+- Stamp-P4 のチップリビジョンは書き込み時に esptool が表示します（`Chip is ESP32-P4 (revision vX.Y)`）。v3.0 以上なら `stamp-p4-r3` を使ってください。
+- USB は TinyUSB（`ARDUINO_USB_MODE=0`）で動かし、CDC(Serial) と USB Audio の複合デバイスになります。
+  - Stamp-P4: 複合デバイスは **USB2 OTG HS** 側に出ます。基板の USB-C は USB Serial/JTAG で、書き込みと起動ログに使います。
+  - StampS3: 書き込めないときは、BOOT ボタン(G0)を押したまま USB を挿してから書き込んでください。
+
+---
+
+## 1. 接続設計
+
+### 1.1 構成
+
+```
+                    ┌────────── ESP32-P4 / ESP32-S3 ─────────┐
+                    │ I2S0 (RX, master, TDM 4slot)            │
+ ES7210 A ─SDOUT1──▶│  DIN_A                                  │
+ (CH1-4)  ◀─MCLK────│  MCLK  ──┬────────────────────────────▶ ES7210 B MCLK
+          ◀─SCLK────│  BCLK  ──┼──┐ (同じパッドを I2S1 の入力にも接続)
+          ◀─LRCK────│  LRCK  ──┼──┼───────────────────────▶ ES7210 B SCLK/LRCK
+                    │          │  ▼                          │
+                    │ I2S1 (RX, slave, TDM 4slot)             │
+ ES7210 B ─SDOUT1──▶│  DIN_B                                  │
+ (CH5-8)            │                                         │
+ A,B ◀──I2C────────▶│  SDA/SCL (400kHz)                       │
+                    └─────────────────────────────────────────┘
+```
+
+- ESP32 の I2S は、TDM モードでは 1 ポートあたりデータ入力が 1 本しかありません。そこで **I2S0 をマスター**（MCLK/BCLK/LRCK を出力し、ES7210 A のデータを受信）、**I2S1 をスレーブ**（I2S0 と同じ BCLK/LRCK パッドを GPIO マトリクスで入力に引き込み、ES7210 B のデータを受信）にしています。
+- 2個の ES7210 は同じ MCLK/SCLK/LRCK で動くため、**サンプリングの瞬間は完全に同期**します。
+- 起動時に I2S1 → I2S0 の順で開始し、2つのポートが同じフレームから取り込みを始めるようにしています（詳細と確認方法は「4. 同期の確認」を参照）。
+- ES7210 は I2C スレーブとして設定します（TDM、I2S フォーマット）。MCLK は通常 256·Fs です。Stamp-P4 で 24/32bit（スロット 32bit）のときだけ 512·Fs にします（IDF 5 の TDM ドライバは MCLK/BCLK が 2 以下だと MCLK 倍率を自動で変えるため、ES7210 の設定とずれないように先に合わせています）。
+
+### 1.2 ピン割り当て
+
+| 信号 | 方向 | ES7210 ピン | **Stamp-P4** | StampS3（M5Capsule） |
+|---|---|---|---|---|
+| MCLK | ESP → A, B | 5 MCLK | **G0**（LPG0） | **G1** |
+| BCLK (SCLK) | ESP → A, B | 9 SCLK | **G35** | **G5** |
+| LRCK | ESP → A, B | 10 LRCK | **G38** | **G7** |
+| DIN_A | A → ESP | 11 SDOUT1/TDMOUT (A) | **G17** | **G9** |
+| DIN_B | B → ESP | 11 SDOUT1/TDMOUT (B) | **G19** | **G44** |
+| SDA | 双方向 | 3 CDATA | **G26** | **G13** (Grove) |
+| SCL | ESP → A, B | 4 CCLK | **G27** | **G15** (Grove) |
+| UART DBG TX | ESP → PC | — | **G37** | **G43** |
+| 3.3V | 電源 | VDDP/VDDD/VDDA/VDDM | 3V3 | 3V3 |
+| GND | | GNDD/GNDA/PGND | GND | GND |
+| microSD | | — | 外付け SDMMC 4bit：CLK=**G12**, CMD=**G10**, D0=**G8**, D1=**G1**, D2=**G21**, D3=**G23** | M5Capsule 内蔵スロット（CS=G11, SCK=G14, MOSI=G12, MISO=G39） |
+| USB（Audio + CDC） | | — | **USB2_HOST_DP / USB2_HOST_DM**（底面パッド）→ 外付け USB コネクタ | 基板の USB-C |
+
+**Stamp-P4 の注意**
+- 外部信号には **2.54mm DIP ピン**（G0, G1, G8, G10, G12, G17, G19, G21, G23, G26, G27, G35, G37, G38）だけを使います。例外は USB HS の D+/D- の2本だけです。
+- **USB HS（UAC2 / CDC）の配線**: 底面のスタンプパッド `USB2 HOST_DP`（D+）と `USB2 HOST_DM`（D−）を、外付けの USB コネクタ（USB-C ブレークアウトなど）の D+/D− へつなぎ、GND も共通にします。
+  - 480Mbps の差動信号なので、**配線はできるだけ短く（数 cm 以内）、D+/D− をより合わせるか平行・等長**にしてください。長いジャンパ線では HS で接続できないことがあります。
+  - コネクタの VBUS（+5V）は **5VIN パッド（VIN）** へつなぐのがおすすめです。VIN と基板 USB-C の 5V（`5V_USB_IN`）は、それぞれ理想ダイオード CH213K を通って `SYS_5V` で合流するので、USB-C と HS を同時に挿しても互いに逆流しません。
+  - **VBUS パッド（`5V_USB_IN`）** につないでも給電できますが、このネットは基板 USB-C の VBUS と同じで、間には過電圧保護 IC（AW32901）しかありません。その場合は USB-C と同時に挿さないでください（HS 側の 5V には過電圧保護も効きません）。
+  - ESP32-P4 の HS デバイスは VBUS 検出を使っていないので、VBUS は給電のためだけの配線です。
+- **基板の USB-C は USB Serial/JTAG（G24/G25、Full-Speed）** です。書き込みと起動ログ、コマンド入力に使えます。HS 側をつながなくても立ち上げ確認ができます。
+- ストラップピンや特殊なピンには、ESP32 からの出力だけを割り当てています。ES7210 の入力はハイインピーダンスなので、起動時のストラップ値は変わりません。
+  - **G35**: BOOT ストラップで、基板に 10k のプルアップがあります → BCLK
+  - **G38**: U0RXD → LRCK
+  - **G37**: U0TXD → デバッグ UART の TX。リセット直後は ROM と IDF のブートログ（115200bps）が出ます。
+  - これらのピンに外付けのプルダウンは付けないでください。
+- **G26/G27** は USB Full-Speed OTG の PHY パッドです（USB としては使っていません）。速度の低い I2C に割り当てています。
+- **microSD**: レベル変換バッファのない、SD バス（4bit）で使えるソケットを使ってください。SPI 専用の SD モジュールは使えません。CMD と D0〜D3 は 10kΩ で 3.3V にプルアップし、カードは 3.3V で給電します。
+- Stamp-P4 にはユーザー用のボタンや LED がありません。操作は USB シリアルのコマンドで行います（「3. 操作」参照）。
+
+**StampS3 の注意**
+- 外部信号には 2.54mm ピッチのピン（G1, G3, G5, G7, G9, G13, G15, G40, G43, G44）だけを使います。G3 と G40 は空きです（G3 はストラッピングピン、G40 は M5Capsule 内蔵 PDM マイクのクロックで、ファームウェアではマイクを無効にしています）。
+- G43/G44 は UART0 のパッドです。リセット直後は ROM のブートログ（115200bps）が G43 に出ます。
+- SD は M5Capsule 内蔵スロットの配線を使います。M5Capsule の電源保持（G46）やボタン（G42）は M5Unified が自動で扱います。
+
+### 1.3 ES7210 周辺回路（各チップ共通）
+
+| ピン | 接続 |
+|---|---|
+| AD0 / AD1 | **A: AD0=GND, AD1=GND → 0x40**、**B: AD0=3.3V, AD1=GND → 0x41** |
+| VDDP, VDDD | 3.3V（各ピンに 0.1µF、近くに 10µF） |
+| VDDA, VDDM | 3.3V（できればアナログ専用 LDO またはフェライトビーズ + 10µF/0.1µF で分離） |
+| REFP12/REFQ12, REFP34/REFQ34, REFQM | データシートのアプリケーション回路どおりのコンデンサを GNDA へ |
+| MICBIAS12, MICBIAS34 | 1µF 程度で GNDA へ。マイクのバイアス電源（前回の回答のマイク回路を参照） |
+| MIC1P/N 〜 MIC4P/N | マイク入力（ECM: 2.2kΩ 負荷 + 1µF カップリング、擬似差動） |
+| SDOUT2/TDMIN, INT, DMIC_CLK | 未接続 |
+| GNDD / GNDA / PGND | GNDA と GNDD はチップ直下で1点接続 |
+
+- MCLK/BCLK/LRCK は2チップに分岐します。配線は短くし、ESP32 の出力側に 22〜33Ω の直列抵抗を入れると反射が抑えられます。
+- I2C は 4.7kΩ で 3.3V にプルアップします（モジュール側にプルアップがあれば不要）。
+- MICBIAS の電圧（`MIC_BIAS_MV`）と PGA ゲイン（`MIC_GAIN_DB`）は config.h で設定します。
+
+## 2. 設定（include/config.h）
+
+| 定義 | 既定値 | 内容 |
+|---|---|---|
+| `SAMPLE_RATE_HZ` | 32000 | 8000〜48000 |
+| `SAMPLE_BITS` | 16 | 16 / 24（3バイトに詰める）/ 32 |
+| `DEFAULT_OUT_MODE` | `OUT_MODE_SD` | 起動時のモード |
+| `MIC_GAIN_DB` | 30 | PGA ゲイン 0〜37.5dB |
+| `MIC_BIAS_MV` | 2870 | MICBIAS 電圧 |
+| `FILE_SPLIT_SEC` | 600 | WAV ファイルを分割する間隔（秒） |
+| `SD_MMC_KHZ` | 20000 | Stamp-P4 の SD クロック（SDMMC 4bit） |
+| `SERIAL_USE_RAW_EP` | S3: 1 / P4: 0 | 1: CDC のバルク IN エンドポイントへ直接転送（S3 用の高速化）／0: Serial.write（P4 は HS なのでこれで十分） |
+| `DEBUG_RATE_HZ` | 1000 | UART DBG の出力レート。ES7210 は `SAMPLE_RATE_HZ`（8kHz 以上）で動かし、`SAMPLE_RATE_HZ / DEBUG_RATE_HZ` 個ごとに 1 行出す |
+| `DEBUG_AVERAGE` | 1 | 1: 間引く区間の平均を出す／0: N 個ごとに 1 サンプルを取り出す |
+| `DEBUG_CH_FIRST` | 0 | UART DBG で出す 4ch の先頭（0: CH1-4、4: CH5-8） |
+| `DEBUG_UART_BAUD` | 921600 | UART DBG の通信速度（TX ピンは `PIN_DEBUG_UART_TX`：P4 は G37、S3 は G43） |
+| `SINGLE_ES7210` | 未定義 | 定義すると ES7210 A だけを使う 4ch のテスト用ビルド（I2S1・ES7210 B は使わない） |
+
+データレートは `Fs × 8ch × バイト数` です（32kHz/16bit で 512 kB/s、48kHz/16bit で 768 kB/s、48kHz/24bit で 1152 kB/s）。
+
+**USB Audio の上限**
+- **Stamp-P4（UAC2 / High-Speed）**: 8ch・48kHz・32bit まで使えます。パケット間隔（1ms / 500µs / 250µs）は、1パケットが 1024 バイトに収まる最長の間隔が自動で選ばれます（例: 48kHz/16bit → 1ms で 784B、48kHz/32bit → 500µs で 800B）。
+- **StampS3（UAC1 / Full-Speed）**: ESP32-S3 の USB FIFO は合計 1KB しかないため、1ms あたりのパケットは 624 バイト以内に収める必要があります。
+  - 16bit: 38kHz まで（**32kHz 推奨**）
+  - 24bit: 25kHz まで（24kHz）
+  - 32bit: 18kHz まで（16kHz）
+
+  この範囲を超える設定では USB Audio は自動で無効になります（SD と SERIAL は使えます）。
+
+## 3. 操作
+
+**USB シリアルのコマンド（両ボード共通）**
+
+1文字のコマンドを送ります（改行は不要）。Stamp-P4 では、基板の USB-C（USB Serial/JTAG）と USB HS 側の CDC のどちらからでも受け付けます。ログも両方に出ます。
+
+| コマンド | 動作 |
+|---|---|
+| `r` | SD モードに切り替えて録音開始 |
+| `s` | SERIAL モードに切り替えて送信開始 |
+| `u` | USB AUDIO モードに切り替え（録音アプリが入力を開くとデータが流れる） |
+| `d` | UART DBG モードに切り替えて出力開始 |
+| `x` | 停止 |
+| `i` | 情報を JSON で返す（停止中のみ） |
+| `l` | 各チャンネルのピークレベル（dBFS）、ドロップ数、アンダーラン数を1行で返す |
+| `g24` + 改行 | ゲインを 24dB に設定 |
+
+**StampS3 のボタン**: ボタン（M5Unified の BtnA。M5Capsule では G42）でも操作できます。
+
+| 操作 | 動作 |
+|---|---|
+| クリック | 開始／停止 |
+| 1秒長押し | モード切替（SD → SERIAL → USB AUDIO → UART DBG） |
+
+LED の色: 緑 = SD、青 = SERIAL、紫 = USB AUDIO、白 = UART DBG、赤の点滅 = 動作中、橙 = ES7210 が見つからない
+
+**SERIAL モード（PC側）**
+
+```
+pip install pyserial numpy
+python tools/ma8_serial_rx.py COM5 -t 10 -o rec.wav
+```
+
+Stamp-P4 では、USB HS 側の CDC の COM ポートを指定してください（基板の USB-C 側ではありません）。
+
+**UART DBG モード**: ES7210 の動作確認用です。USB-UART 変換器の RX を TX ピン（P4: G37、S3: G43）につなぎ（GND も共通に）、921600bps で開きます。開始すると最初にラベル行 `CH1,CH2,CH3,CH4` を出し、その後は 1 行ごとに 4ch の値（SAMPLE_BITS 単位の符号付き整数）を出します。Arduino IDE のシリアルプロッタなどでそのまま波形を見られます。ES7210 は 8kHz 未満では動かないため、サンプリングは `SAMPLE_RATE_HZ` のまま行い、出力だけを間引いています。
+
+**USB AUDIO モード**: 「MA8 8ch Microphone」（`SINGLE_ES7210` のときは 4ch）として認識されます。録音アプリが入力を開いている間だけデータを流します。
+
+## 4. 同期の確認
+
+起動ログ（シリアルモニタ）に次の行が出ます。
+
+```
+BCLK stops while I2S0 stopped: yes (A/B start alignment guaranteed)
+```
+
+`no` と表示された場合は、A/B の取り込み開始が1フレームずれている可能性があります。その場合は、A の MIC1 と B の MIC1 に同じ音を入れて、次のコマンドで確認してください。
+
+```
+python tools/ma8_serial_rx.py COM5 -t 3 --sync-check
+```
+
+`CH5 delay vs CH1 = 0 samples` と表示されれば揃っています。
+
+## 5. ファイル構成
+
+```
+platformio.ini            StampS3 のビルド設定（espressif32@6.13.0）
+p4/platformio.ini         Stamp-P4 のビルド設定（pioarduino、core_dir 分離、src_dir = ../src）
+p4/variants/m5stack_stamp_p4/pins_arduino.h   Stamp-P4 用 Arduino バリアント
+include/config.h          設定（#define）、ボードごとのピン割り当て
+src/main.cpp              UI、コマンド、モード管理、SD/シリアル/デバッグ UART 出力（共通）
+src/capture.h             I2S0/I2S1 TDM 受信 → 8ch フレーム化 → リングバッファ
+src/s3/capture.cpp          StampS3 実装（legacy driver/i2s.h）
+src/p4/capture.cpp          Stamp-P4 実装（driver/i2s_tdm.h）
+src/usb_audio.h           USB Audio マイク（TinyUSB アプリケーションクラスドライバ）
+src/s3/usb_audio.cpp        StampS3 実装（UAC1、Full-Speed）
+src/p4/usb_audio.cpp        Stamp-P4 実装（UAC2、High-Speed）
+src/es7210.*              ES7210 レジスタ設定（I2C は S3: M5.Ex_I2C、P4: Wire）
+src/serial_stream.*       バイナリパケット送信
+src/wav_writer.*          WAV 書き込み
+src/ringbuf.h             SPSC リングバッファ
+tools/ma8_serial_rx.py    PC 受信スクリプト
+```
