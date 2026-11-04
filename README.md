@@ -7,7 +7,7 @@ ES7210（4ch オーディオADC）を2個使い、**8ch を同時サンプリン
 | **SD** | microSD に 8ch WAV で保存（`/MA8/R0001_00.WAV` …） |
 | **SERIAL** | USB-CDC でバイナリパケットを送信。PC側は [tools/ma8_serial_rx.py](tools/ma8_serial_rx.py) で受信して WAV に保存 |
 | **USB AUDIO** | 8ch マイクとして認識される（Windows/macOS/Linux 標準ドライバ、Audacity などで録音）。StampS3 は UAC1（Full-Speed）、Stamp-P4 は UAC2（High-Speed） |
-| **UART DBG** | デバッグ用。4ch を約 1kHz に間引き、テキスト（CSV）でハードウェア UART へ出力（921600bps） |
+| **UART DBG** | デバッグ用。全チャンネルを間引いて（4ch: 約 1kHz、8ch: 約 500Hz）、テキスト（CSV）でハードウェア UART へ出力（921600bps） |
 
 対応モジュールは2種類です。
 
@@ -136,9 +136,10 @@ pio device monitor
 | `FILE_SPLIT_SEC` | 600 | WAV ファイルを分割する間隔（秒） |
 | `SD_MMC_KHZ` | 20000 | Stamp-P4 の SD クロック（SDMMC 4bit） |
 | `SERIAL_USE_RAW_EP` | S3: 1 / P4: 0 | 1: CDC のバルク IN エンドポイントへ直接転送（S3 用の高速化）／0: Serial.write（P4 は HS なのでこれで十分） |
-| `DEBUG_RATE_HZ` | 1000 | UART DBG の出力レート。ES7210 は `SAMPLE_RATE_HZ`（8kHz 以上）で動かし、`SAMPLE_RATE_HZ / DEBUG_RATE_HZ` 個ごとに 1 行出す |
-| `DEBUG_AVERAGE` | 1 | 1: 間引く区間の平均を出す／0: N 個ごとに 1 サンプルを取り出す |
-| `DEBUG_CH_FIRST` | 0 | UART DBG で出す 4ch の先頭（0: CH1-4、4: CH5-8） |
+| `DEBUG_CH` | `NUM_CH` | UART DBG で 1 行に出すチャンネル数（8ch ビルドでは 8。4 にすると `DEBUG_CH_FIRST` から 4ch） |
+| `DEBUG_RATE_HZ` | 4ch: 1000 / 8ch: 500 | UART DBG の出力レート。ES7210 は `SAMPLE_RATE_HZ`（8kHz 以上）で動かし、`SAMPLE_RATE_HZ / DEBUG_RATE_HZ` 個ごとに 1 行出す。通信速度に収まらない設定はビルドエラーになる |
+| `DEBUG_AVERAGE` | 1 | 1: 間引く区間の平均／0: N 個ごとに 1 サンプル／2: 区間のピーク（絶対値の最大。マイクが反応しているかを見るのに便利） |
+| `DEBUG_CH_FIRST` | 0 | `DEBUG_CH` を 4 にしたときの先頭（0: CH1-4、4: CH5-8） |
 | `DEBUG_UART_BAUD` | 921600 | UART DBG の通信速度（TX ピンは `PIN_DEBUG_UART_TX`：P4 は G37、S3 は G43） |
 | `SINGLE_ES7210` | 未定義 | 定義すると ES7210 A だけを使う 4ch のテスト用ビルド（I2S1・ES7210 B は使わない） |
 
@@ -188,7 +189,7 @@ python tools/ma8_serial_rx.py COM5 -t 10 -o rec.wav
 
 Stamp-P4 では、USB HS 側の CDC の COM ポートを指定してください（基板の USB-C 側ではありません）。
 
-**UART DBG モード**: ES7210 の動作確認用です。USB-UART 変換器の RX を TX ピン（P4: G37、S3: G43）につなぎ（GND も共通に）、921600bps で開きます。開始すると最初にラベル行 `CH1,CH2,CH3,CH4` を出し、その後は 1 行ごとに 4ch の値（SAMPLE_BITS 単位の符号付き整数）を出します。Arduino IDE のシリアルプロッタなどでそのまま波形を見られます。ES7210 は 8kHz 未満では動かないため、サンプリングは `SAMPLE_RATE_HZ` のまま行い、出力だけを間引いています。
+**UART DBG モード**: ES7210 の動作確認用です。USB-UART 変換器の RX を TX ピン（P4: G37、S3: G43）につなぎ（GND も共通に）、921600bps で開きます。開始すると最初にラベル行（`CH1,CH2,...,CH8`、4ch ビルドでは `CH1,...,CH4`）を出し、その後は 1 行ごとに全チャンネルの値（SAMPLE_BITS 単位の整数）を出します。8ch で見るときは config.h の `#define SINGLE_ES7210` をコメントアウトしてください。Arduino IDE のシリアルプロッタなどでそのまま波形を見られます。ES7210 は 8kHz 未満では動かないため、サンプリングは `SAMPLE_RATE_HZ` のまま行い、出力だけを間引いています。
 
 **USB AUDIO モード**: 「MA8 8ch Microphone」（`SINGLE_ES7210` のときは 4ch）として認識されます。録音アプリが入力を開いている間だけデータを流します。
 

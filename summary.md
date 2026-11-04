@@ -1,11 +1,22 @@
 # MA8 引き継ぎメモ（VSCode の Claude 向け）
 
-作成日: 2026-10-20 / 更新: 2026-10-28（Stamp-P4 対応、CoreS3 削除）
+作成日: 2026-10-20 / 更新: 2026-11-04（UART DBG の 8ch 出力、PC 移行）
+
+> 別の PC で作業を続けるときは、このファイルと README.md を読めば前提がわかるようにしてある。Claude Code のチャット履歴（`~/.claude/projects/.../*.jsonl`）は個人情報を含むので、公開リポジトリには置いていない。
+
+## 0. 直近の作業（2026-11-04）
+
+- UART DBG（`OUT_MODE_DEBUG_UART`）を全チャンネル出力にした。`DEBUG_CH`（既定 `NUM_CH`）、8ch では `DEBUG_RATE_HZ` 500（4ch は 1000）。
+  - 通信速度（921600bps）に収まらない組み合わせは `static_assert` でビルドエラーにしている。
+  - `DEBUG_AVERAGE 2` でピーク（|x| の最大）を出す。平均だと音声の交流成分が消えるので、マイクが反応しているかを見るならピークがよい。
+  - StampS3 の 8ch（16/32bit）でビルドが通ることを確認済み。実機では未確認。
+- 8ch で使うには config.h の `#define SINGLE_ES7210` をコメントアウトする（現在は定義したまま）。
+- 次にやること: 8ch の UART DBG で MIC1〜4（ES7210 B も）を1本ずつつなぎ、チャンネル対応表を取る（§2 の未解決事項）。
 
 ## 1. 目的
 
 - ES7210（4ch ADC）×2 で 8ch 同時サンプリングを行う装置を作る。
-- 出力は4モード：SD（WAV）、USB シリアル（バイナリ）、USB オーディオ（UAC）、デバッグ UART（約1kHz の CSV）。
+- 出力は4モード：SD（WAV）、USB シリアル（バイナリ）、USB オーディオ（UAC）、デバッグ UART（4ch は約 1kHz、8ch は約 500Hz の CSV）。
 - PlatformIO を使う。サンプリングレートとビット数は `#define`（`include/config.h`）で設定する。
 - 対象ボード：
   - **M5Stack Stamp-P4（ESP32-P4）＝本命**。USB HS + UAC2 で 8ch/48kHz/24bit を USB Audio で出すため。
@@ -31,6 +42,7 @@
   - `core_dir = ~/.platformio-pioarduino` で隔離している。pioarduino は core の penv に自前の PlatformIO フォーク（`pioarduino` パッケージ）を上書きインストールし、`toolchain-*` などの `@` 付きディレクトリを削除するため、通常の `~/.platformio` で使うと他プロジェクトを壊す（実際に一度壊して復旧した）。
   - pioarduino はコマンドを PowerShell / cmd から実行すること。Git Bash（MSYS）からだと `idf_tools.py` が「MSys/Mingw is not supported」で失敗する。
   - 公式の Stamp-P4 手順（pioarduino 54.03.21）は esptool 5.0.0-dev1 が click 8.3 と非互換でビルドできない。
+- 新しい PC では、PlatformIO（VSCode 拡張）を入れて `pio run -e m5stamps3` を実行すれば espressif32@6.13.0 が入る。`pio run -d p4` を初めて実行すると、pioarduino 一式が `~/.platformio-pioarduino` に入る（PowerShell から実行すること）。
 - ソース切り替え: `build_src_filter` で `src/s3/` と `src/p4/` を切り替える。共通は main.cpp、es7210、serial_stream、wav_writer、ringbuf。
 
 ## 4. 設計の要点（理由つき）

@@ -223,11 +223,11 @@ static void dbgStart() {
     memset(g_dbg_acc, 0, sizeof(g_dbg_acc));
     g_dbg_n = 0;
     // label line (Arduino serial plotter etc.)
-    g_dbg.printf("CH%d,CH%d,CH%d,CH%d\n", DEBUG_CH_FIRST + 1, DEBUG_CH_FIRST + 2, DEBUG_CH_FIRST + 3,
-                 DEBUG_CH_FIRST + 4);
+    for (int c = 0; c < DEBUG_CH; c++) g_dbg.printf("CH%d%c", DEBUG_CH_FIRST + c + 1, c + 1 < DEBUG_CH ? ',' : '\n');
     capture::setSink(true);
-    logf("debug UART: TX=G%d %d baud, %.1f Hz (Fs %d / %d, %s)", PIN_DEBUG_UART_TX, DEBUG_UART_BAUD,
-         SAMPLE_RATE_HZ / (float)DEBUG_DECIM, SAMPLE_RATE_HZ, DEBUG_DECIM, DEBUG_AVERAGE ? "mean" : "pick");
+    logf("debug UART: TX=G%d %d baud, CH%d-%d, %.1f Hz (Fs %d / %d, %s)", PIN_DEBUG_UART_TX, DEBUG_UART_BAUD,
+         DEBUG_CH_FIRST + 1, DEBUG_CH_FIRST + DEBUG_CH, SAMPLE_RATE_HZ / (float)DEBUG_DECIM, SAMPLE_RATE_HZ,
+         DEBUG_DECIM, DEBUG_AVERAGE == 2 ? "peak" : DEBUG_AVERAGE ? "mean" : "pick");
 }
 
 static void dbgStop() { capture::setSink(false); }
@@ -246,22 +246,25 @@ static void dbgService() {
             const uint8_t* s = p + DEBUG_CH_FIRST * OUT_BYTES;
             g_dbg_n++;
             for (int c = 0; c < DEBUG_CH; c++) {
-#if DEBUG_AVERAGE
-                g_dbg_acc[c] += sampleAt(s + c * OUT_BYTES);
+                int64_t x = sampleAt(s + c * OUT_BYTES);
+#if DEBUG_AVERAGE == 2
+                if (x < 0) x = -x;
+                if (x > g_dbg_acc[c]) g_dbg_acc[c] = x;
+#elif DEBUG_AVERAGE
+                g_dbg_acc[c] += x;
 #else
-                if (g_dbg_n == DEBUG_DECIM) g_dbg_acc[c] = sampleAt(s + c * OUT_BYTES);
+                if (g_dbg_n == DEBUG_DECIM) g_dbg_acc[c] = x;
 #endif
             }
             if (g_dbg_n < DEBUG_DECIM) continue;
-            int32_t v[DEBUG_CH];
             for (int c = 0; c < DEBUG_CH; c++) {
-                v[c] = DEBUG_AVERAGE ? (int32_t)(g_dbg_acc[c] / DEBUG_DECIM) : (int32_t)g_dbg_acc[c];
+                int64_t v = (DEBUG_AVERAGE == 1) ? g_dbg_acc[c] / DEBUG_DECIM : g_dbg_acc[c];
+                if (v > INT32_MAX) v = INT32_MAX;  // peak of -2^31
+                len += snprintf(line + len, sizeof(line) - len, "%ld%c", (long)v, c + 1 < DEBUG_CH ? ',' : '\n');
                 g_dbg_acc[c] = 0;
             }
             g_dbg_n = 0;
-            len += snprintf(line + len, sizeof(line) - len, "%ld,%ld,%ld,%ld\n", (long)v[0], (long)v[1],
-                            (long)v[2], (long)v[3]);
-            if (len > sizeof(line) - 64) {
+            if (len > sizeof(line) - 128) {  // room for one more line (8ch x 12 chars)
                 g_dbg.write((const uint8_t*)line, len);
                 len = 0;
             }

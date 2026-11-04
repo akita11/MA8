@@ -39,7 +39,7 @@
 #define OUT_MODE_SD         0           // record to microSD as WAV
 #define OUT_MODE_SERIAL     1           // stream binary packets over USB CDC
 #define OUT_MODE_USB_AUDIO  2           // USB Audio microphone (StampS3: UAC1 FS, Stamp-P4: UAC2 HS)
-#define OUT_MODE_DEBUG_UART 3           // debug: 4ch decimated to ~1 kHz, text (CSV) on a hardware UART
+#define OUT_MODE_DEBUG_UART 3           // debug: all ch decimated to ~1 kHz (8ch: 500 Hz), text (CSV) on a hardware UART
 #define NUM_OUT_MODES       4
 
 #define DEFAULT_OUT_MODE OUT_MODE_DEBUG_UART // default output mode at boot (can be changed by button / touch)
@@ -143,10 +143,20 @@
 
 // ------------------------------------------------------------------ debug UART (OUT_MODE_DEBUG_UART)
 // ES7210 runs at SAMPLE_RATE_HZ (>= 8 kHz); the output is decimated by DEBUG_DECIM to ~DEBUG_RATE_HZ.
-// One line per output frame: "v1,v2,v3,v4\n" (signed integers in SAMPLE_BITS units).
+// One line per output frame: "v1,v2,...\n" (DEBUG_CH signed integers in SAMPLE_BITS units).
+#ifndef DEBUG_CH
+#define DEBUG_CH            NUM_CH              // channels per line: all (8 in an 8ch build), or 4 with DEBUG_CH_FIRST
+#endif
+#ifndef DEBUG_RATE_HZ
+#if DEBUG_CH > 4
+#define DEBUG_RATE_HZ       500                 // 8ch: keep the text within the UART bandwidth (also at 32bit)
+#else
 #define DEBUG_RATE_HZ       1000
-#define DEBUG_AVERAGE       1                   // 1: mean of DEBUG_DECIM samples, 0: every DEBUG_DECIM-th sample
-#define DEBUG_CH_FIRST      0                   // output CH(DEBUG_CH_FIRST+1)..+4 (4: ES7210 B in an 8ch build)
+#endif
+#endif
+#define DEBUG_AVERAGE       1                   // 0: every DEBUG_DECIM-th sample, 1: mean of DEBUG_DECIM samples,
+                                                // 2: peak |x| of DEBUG_DECIM samples (mic level check)
+#define DEBUG_CH_FIRST      0                   // first output channel - 1 (4 with DEBUG_CH 4: ES7210 B only)
 #define DEBUG_UART_BAUD     921600
 #define PIN_DEBUG_UART_RX   -1                  // UART1 RX: not used
 
@@ -219,8 +229,11 @@
 static_assert(SAMPLE_RATE_HZ >= 8000 && SAMPLE_RATE_HZ <= 48000, "ES7210 single speed: 8k..48kHz");
 #define SD_WRITE_CHUNK      (SD_WRITE_FRAMES * FRAME_BYTES)
 
-#define DEBUG_CH            4
 #define DEBUG_DECIM         ((SAMPLE_RATE_HZ + DEBUG_RATE_HZ / 2) / DEBUG_RATE_HZ)
 static_assert(DEBUG_DECIM >= 1, "DEBUG_RATE_HZ too high");
+// worst-case line: "-32768," (16bit) / "-8388608," (24bit) / "-2147483648," (32bit) per channel, 10 bits per byte
+#define DEBUG_VALUE_CHARS   (SAMPLE_BITS == 16 ? 7 : SAMPLE_BITS == 24 ? 9 : 12)
+static_assert(1ULL * DEBUG_CH * DEBUG_VALUE_CHARS * 10 * SAMPLE_RATE_HZ / DEBUG_DECIM <= DEBUG_UART_BAUD,
+              "debug UART: DEBUG_RATE_HZ too high for DEBUG_CH / SAMPLE_BITS / DEBUG_UART_BAUD");
 static_assert(DEBUG_CH_FIRST + DEBUG_CH <= NUM_CH, "DEBUG_CH_FIRST out of range");
 static_assert(I2S_DMA_FRAMES * 4 * (SLOT_BITS / 8) <= 4092, "I2S DMA buffer too large");
