@@ -8,9 +8,15 @@
 
 #include <stdint.h>
 
+#include "config.h"
 #include "ringbuf.h"
 
 namespace capture {
+
+// Source of output channel c in the merged block: 0..3 = I2S0 slot (A), 4..7 = I2S1 slot (B)
+// (ES7210_SLOT_OF_MIC in config.h)
+constexpr uint8_t kSlotOfMic[4] = ES7210_SLOT_OF_MIC;
+constexpr uint8_t srcOfChannel(int c) { return (uint8_t)((c >> 2) * 4 + kSlotOfMic[c & 3]); }
 
 struct Status {
     bool es_a = false;          // ES7210 A answered on I2C and was configured
@@ -35,5 +41,7 @@ void takePeaks(float* peak);
 
 bool setGain(float db);         // both ES7210
 float gain();
+
+void dumpRegs();                // log the registers of the ES7210(s) and check them (serial command 'R')
 
 }  // namespace capture

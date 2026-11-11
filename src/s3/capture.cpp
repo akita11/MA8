@@ -3,7 +3,9 @@
 
 #include <Arduino.h>
 #include <M5Unified.h>
+#include <Wire.h>
 #include <driver/gpio.h>
+#include <driver/i2c.h>
 #include <driver/i2s.h>
 #include <esp_heap_caps.h>
 #include <esp_rom_gpio.h>
@@ -11,6 +13,7 @@
 
 #include "config.h"
 #include "../es7210.h"
+#include "../log.h"
 
 namespace capture {
 
@@ -91,11 +94,16 @@ static bool installI2S() {
     const int pins[2] = {PIN_I2S_BCLK, PIN_I2S_LRCK};
     const uint32_t out_sig[2] = {I2S0I_BCK_OUT_IDX, I2S0I_WS_OUT_IDX};
     const uint32_t in_sig[2] = {I2S1I_BCK_IN_IDX, I2S1I_WS_IN_IDX};
+    // ES7210_LRCK_INVERT: LRCK is inverted on the pad and inverted back into I2S1,
+    // so only the ES7210s see the inverted LRCK (I2S0 and I2S1 stay in step).
+    const bool inv[2] = {false, ES7210_LRCK_INVERT != 0};
     for (int i = 0; i < 2; i++) {
         gpio_set_direction((gpio_num_t)pins[i], GPIO_MODE_INPUT_OUTPUT);
-        esp_rom_gpio_connect_out_signal(pins[i], out_sig[i], false, false);
-        esp_rom_gpio_connect_in_signal(pins[i], in_sig[i], false);
+        esp_rom_gpio_connect_out_signal(pins[i], out_sig[i], inv[i], false);
+        esp_rom_gpio_connect_in_signal(pins[i], in_sig[i], inv[i]);
     }
+#elif ES7210_LRCK_INVERT
+    esp_rom_gpio_connect_out_signal(PIN_I2S_LRCK, I2S0I_WS_OUT_IDX, true, false);
 #endif
     return true;
 }
@@ -156,10 +164,11 @@ static size_t convert(size_t frames, uint32_t* pk) {
     uint8_t* o = s_out;
     for (size_t f = 0; f < frames; f++) {
         for (int c = 0; c < NUM_CH; c++) {
+            const uint8_t src = srcOfChannel(c);  // channel order: see ES7210_SLOT_OF_MIC in config.h
 #ifdef SINGLE_ES7210
-            int32_t v = a[f * 4 + c];
+            int32_t v = a[f * 4 + src];
 #else
-            int32_t v = (c < 4) ? a[f * 4 + c] : b[f * 4 + (c - 4)];
+            int32_t v = (src < 4) ? a[f * 4 + src] : b[f * 4 + (src - 4)];
 #endif
 #if SAMPLE_BITS == 16
             uint32_t m = uabs32(v) << 16;
@@ -235,11 +244,37 @@ bool begin() {
     if (!s_st.i2s_ok) return false;
     delay(10);  // MCLK running before ES7210 configuration
 
-    M5.Ex_I2C.begin(I2C_NUM_0, PIN_I2C_SDA, PIN_I2C_SCL);
-    s_st.es_a = s_esA.begin(ES7210_ADDR_A, SAMPLE_RATE_HZ, SLOT_BITS, s_gain, MIC_BIAS_MV);
-#ifndef SINGLE_ES7210
-    s_st.es_b = s_esB.begin(ES7210_ADDR_B, SAMPLE_RATE_HZ, SLOT_BITS, s_gain, MIC_BIAS_MV);
+    // ES7210 configuration over I2C: repeated until every chip is configured
+    for (uint32_t attempt = 1;; attempt++) {
+#if I2C_USE_M5_EX_I2C
+        logf("I2C init #%lu: SDA=G%d SCL=G%d %d Hz (M5.Ex_I2C, no glitch filter)", (unsigned long)attempt,
+             PIN_I2C_SDA, PIN_I2C_SCL, I2C_FREQ_HZ);
+        if (attempt > 1) M5.Ex_I2C.release();  // start again from a free bus
+        if (!M5.Ex_I2C.begin(I2C_NUM_0, PIN_I2C_SDA, PIN_I2C_SCL)) logf("  I2C bus begin NG");
+#else
+        logf("I2C init #%lu: SDA=G%d SCL=G%d %d Hz (Wire, glitch filter %d)", (unsigned long)attempt, PIN_I2C_SDA,
+             PIN_I2C_SCL, I2C_FREQ_HZ, I2C_GLITCH_FILTER_CYC);
+        if (attempt > 1) Wire.end();  // start again from a free bus
+        if (!Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL, I2C_FREQ_HZ)) logf("  I2C bus begin NG");
+        if (i2c_filter_enable(I2C_NUM_0, I2C_GLITCH_FILTER_CYC) != ESP_OK) logf("  I2C glitch filter NG");
 #endif
+        if (!s_st.es_a) {
+            logf("ES7210 A:");
+            s_st.es_a = s_esA.begin(ES7210_ADDR_A, SAMPLE_RATE_HZ, SLOT_BITS, s_gain, MIC_BIAS_MV);
+        }
+#ifndef SINGLE_ES7210
+        if (!s_st.es_b) {
+            logf("ES7210 B:");
+            s_st.es_b = s_esB.begin(ES7210_ADDR_B, SAMPLE_RATE_HZ, SLOT_BITS, s_gain, MIC_BIAS_MV);
+        }
+        if (s_st.es_a && s_st.es_b) break;
+#else
+        if (s_st.es_a) break;
+#endif
+        logf("I2C init failed, retry in %d ms", I2C_RETRY_MS);
+        delay(I2C_RETRY_MS);
+    }
+    logf("I2C init done");
     delay(20);
 
     syncRestart();
@@ -276,5 +311,12 @@ bool setGain(float db) {
 }
 
 float gain() { return s_gain; }
+
+void dumpRegs() {
+    s_esA.dump();
+#ifndef SINGLE_ES7210
+    s_esB.dump();
+#endif
+}
 
 }  // namespace capture

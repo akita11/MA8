@@ -19,6 +19,7 @@ bool active();
 
 uint32_t underruns();       // packets with not enough data
 uint32_t parityFixes();     // iso IN parity re-sync count (diagnostics, StampS3 only)
-uint32_t packets();
+uint32_t packets();         // packets sent
+uint32_t aborts();          // armed packets dropped when the host left streaming (StampS3 only)
 
 }  // namespace usb_audio

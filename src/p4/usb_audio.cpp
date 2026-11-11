@@ -284,6 +284,7 @@ bool active() { return s_active; }
 uint32_t underruns() { return s_underruns; }
 uint32_t parityFixes() { return 0; }
 uint32_t packets() { return s_packets; }
+uint32_t aborts() { return 0; }
 
 }  // namespace usb_audio
 
@@ -302,6 +303,7 @@ bool active() { return false; }
 uint32_t underruns() { return 0; }
 uint32_t parityFixes() { return 0; }
 uint32_t packets() { return 0; }
+uint32_t aborts() { return 0; }
 }  // namespace usb_audio
 
 #endif

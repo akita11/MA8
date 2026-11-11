@@ -5,14 +5,20 @@
 //   Output : SD (WAV) / USB serial (binary) / USB Audio (S3: UAC1 FS, P4: UAC2 HS) / debug UART
 
 #include <Arduino.h>
+#include <esp_system.h>
+#if defined(MA8_BOARD_STAMPS3)
+#include <esp_core_dump.h>
+#endif
 
 #include "capture.h"
 #include "config.h"
+#include "log.h"
 #include "serial_stream.h"
 #include "usb_audio.h"
 #include "wav_writer.h"
 
 #if USE_M5UNIFIED
+#include <FastLED.h>
 #include <M5Unified.h>
 #endif
 
@@ -49,7 +55,7 @@ static const char* modeName(uint8_t m) {
 
 // Logs go to the USB CDC, except while binary data is streamed on it.
 // Stamp-P4: also to the on-board USB-C (USB Serial/JTAG), which works without the HS connector.
-static void logf(const char* fmt, ...) {
+void logf(const char* fmt, ...) {
     char buf[160];
     va_list ap;
     va_start(ap, fmt);
@@ -130,6 +136,7 @@ static bool sdStart() {
     capture::resetCounters();
     capture::setSink(true);
     setMsg(g_path);
+    logf("SD rec: start -> %s (%d Hz, %d bit, %d ch WAV)", g_path, SAMPLE_RATE_HZ, SAMPLE_BITS, NUM_CH);
     return true;
 }
 
@@ -154,6 +161,7 @@ static void sdService(bool flush_all) {
             g_wav.close();
             g_part++;
             if (!openPart()) setMsg("WAV open failed");
+            else logf("SD rec: next file %s", g_path);
         }
     }
     if (millis() - g_last_flush > FILE_FLUSH_MS) {
@@ -169,6 +177,8 @@ static void sdStop() {
     char m[64];
     snprintf(m, sizeof(m), "saved %s", g_path);
     setMsg(m);
+    logf("SD rec: stop, %.1f s, %lu files, dropped %lu frames", (millis() - g_start_ms) / 1000.0f,
+         (unsigned long)(g_part + 1), (unsigned long)capture::droppedFrames());
 }
 
 // ============================================================================ serial stream
@@ -195,9 +205,33 @@ static void serialService() {
 }
 
 // ============================================================================ debug UART (text, ~1 kHz)
+// Output: hardware UART on PIN_DEBUG_UART_TX with UART_G43, otherwise the USB CDC (same as the logs)
+#ifdef UART_G43
 static HardwareSerial& g_dbg = Serial1;
-static int64_t g_dbg_acc[DEBUG_CH];
+static void dbgWrite(const char* s, size_t len) { g_dbg.write((const uint8_t*)s, len); }
+#else
+static void dbgWrite(const char* s, size_t len) {
+    Serial.write((const uint8_t*)s, len);
+#if defined(MA8_BOARD_STAMPP4)
+    JtagSerial.write((const uint8_t*)s, len);
+#endif
+}
+#endif
 static uint32_t g_dbg_n = 0;
+#ifdef OUT_MODE_DEBUG_UART_PEAK
+static int32_t g_dbg_max[DEBUG_CH], g_dbg_min[DEBUG_CH];
+#define DBG_LINE_MAX (DEBUG_CH * 12 + 2)      // room for one more line: 12 chars per ch
+static void dbgResetAcc() {
+    for (int c = 0; c < DEBUG_CH; c++) {
+        g_dbg_max[c] = INT32_MIN;
+        g_dbg_min[c] = INT32_MAX;
+    }
+}
+#else
+static int64_t g_dbg_acc[DEBUG_CH];
+#define DBG_LINE_MAX (DEBUG_CH * 12 + 2)      // room for one more line: 12 chars per ch
+static void dbgResetAcc() { memset(g_dbg_acc, 0, sizeof(g_dbg_acc)); }
+#endif
 
 static inline int32_t sampleAt(const uint8_t* p) {
 #if OUT_BYTES == 2
@@ -212,22 +246,43 @@ static inline int32_t sampleAt(const uint8_t* p) {
 }
 
 static void dbgStart() {
+#ifdef UART_G43
     static bool begun = false;
     if (!begun) {
         g_dbg.setTxBufferSize(4096);
         g_dbg.begin(DEBUG_UART_BAUD, SERIAL_8N1, PIN_DEBUG_UART_RX, PIN_DEBUG_UART_TX);
         begun = true;
     }
+    logf("debug UART: TX=G%d %d baud, CH%d-%d, %.1f Hz (Fs %d / %d, %s)", PIN_DEBUG_UART_TX, DEBUG_UART_BAUD,
+#else
+    logf("debug UART: USB serial, CH%d-%d, %.1f Hz (Fs %d / %d, %s)",
+#endif
+         DEBUG_CH_FIRST + 1, DEBUG_CH_FIRST + DEBUG_CH, SAMPLE_RATE_HZ / (float)DEBUG_DECIM, SAMPLE_RATE_HZ,
+         DEBUG_DECIM,
+#ifdef OUT_MODE_DEBUG_UART_PEAK
+         "max-min"
+#else
+         DEBUG_AVERAGE == 2 ? "peak" : DEBUG_AVERAGE ? "mean" : "pick"
+#endif
+    );
     capture::ring().discard();
     capture::resetCounters();
-    memset(g_dbg_acc, 0, sizeof(g_dbg_acc));
+    dbgResetAcc();
     g_dbg_n = 0;
-    // label line (Arduino serial plotter etc.)
-    g_dbg.printf("CH%d,CH%d,CH%d,CH%d\n", DEBUG_CH_FIRST + 1, DEBUG_CH_FIRST + 2, DEBUG_CH_FIRST + 3,
-                 DEBUG_CH_FIRST + 4);
+    // label line (Arduino serial plotter etc.), after the log line
+    char label[DEBUG_CH * 16 + 1];
+    size_t len = 0;
+    for (int c = 0; c < DEBUG_CH; c++) {
+        char sep = c + 1 < DEBUG_CH ? ',' : '\n';
+        int ch = DEBUG_CH_FIRST + c + 1;
+#ifdef OUT_MODE_DEBUG_UART_PEAK
+        len += snprintf(label + len, sizeof(label) - len, "CH%dpp%c", ch, sep);  // pp = max - min
+#else
+        len += snprintf(label + len, sizeof(label) - len, "CH%d%c", ch, sep);
+#endif
+    }
+    dbgWrite(label, len);
     capture::setSink(true);
-    logf("debug UART: TX=G%d %d baud, %.1f Hz (Fs %d / %d, %s)", PIN_DEBUG_UART_TX, DEBUG_UART_BAUD,
-         SAMPLE_RATE_HZ / (float)DEBUG_DECIM, SAMPLE_RATE_HZ, DEBUG_DECIM, DEBUG_AVERAGE ? "mean" : "pick");
 }
 
 static void dbgStop() { capture::setSink(false); }
@@ -245,31 +300,48 @@ static void dbgService() {
         for (size_t i = 0; i < n; i++, p += FRAME_BYTES) {
             const uint8_t* s = p + DEBUG_CH_FIRST * OUT_BYTES;
             g_dbg_n++;
+#ifdef OUT_MODE_DEBUG_UART_PEAK
+            // max / min of each channel over DEBUG_PEAK_MS
             for (int c = 0; c < DEBUG_CH; c++) {
-#if DEBUG_AVERAGE
-                g_dbg_acc[c] += sampleAt(s + c * OUT_BYTES);
+                int32_t x = sampleAt(s + c * OUT_BYTES);
+                if (x > g_dbg_max[c]) g_dbg_max[c] = x;
+                if (x < g_dbg_min[c]) g_dbg_min[c] = x;
+            }
+            if (g_dbg_n < DEBUG_DECIM) continue;
+            for (int c = 0; c < DEBUG_CH; c++)  // amplitude (peak to peak); int64: 32bit max - min overflows int32
+                len += snprintf(line + len, sizeof(line) - len, "%lld%c",
+                                (long long)((int64_t)g_dbg_max[c] - g_dbg_min[c]), c + 1 < DEBUG_CH ? ',' : '\n');
+            dbgResetAcc();
 #else
-                if (g_dbg_n == DEBUG_DECIM) g_dbg_acc[c] = sampleAt(s + c * OUT_BYTES);
+            for (int c = 0; c < DEBUG_CH; c++) {
+                int64_t x = sampleAt(s + c * OUT_BYTES);
+#if DEBUG_AVERAGE == 2
+                if (x < 0) x = -x;
+                if (x > g_dbg_acc[c]) g_dbg_acc[c] = x;
+#elif DEBUG_AVERAGE
+                g_dbg_acc[c] += x;
+#else
+                if (g_dbg_n == DEBUG_DECIM) g_dbg_acc[c] = x;
 #endif
             }
             if (g_dbg_n < DEBUG_DECIM) continue;
-            int32_t v[DEBUG_CH];
             for (int c = 0; c < DEBUG_CH; c++) {
-                v[c] = DEBUG_AVERAGE ? (int32_t)(g_dbg_acc[c] / DEBUG_DECIM) : (int32_t)g_dbg_acc[c];
+                int64_t v = (DEBUG_AVERAGE == 1) ? g_dbg_acc[c] / DEBUG_DECIM : g_dbg_acc[c];
+                if (v > INT32_MAX) v = INT32_MAX;  // peak of -2^31
+                len += snprintf(line + len, sizeof(line) - len, "%ld%c", (long)v, c + 1 < DEBUG_CH ? ',' : '\n');
                 g_dbg_acc[c] = 0;
             }
+#endif
             g_dbg_n = 0;
-            len += snprintf(line + len, sizeof(line) - len, "%ld,%ld,%ld,%ld\n", (long)v[0], (long)v[1],
-                            (long)v[2], (long)v[3]);
-            if (len > sizeof(line) - 64) {
-                g_dbg.write((const uint8_t*)line, len);
+            if (len > sizeof(line) - DBG_LINE_MAX) {
+                dbgWrite(line, len);
                 len = 0;
             }
         }
         r.consume(n);
         budget -= n;
     }
-    if (len) g_dbg.write((const uint8_t*)line, len);
+    if (len) dbgWrite(line, len);
 }
 
 // ============================================================================ run control
@@ -339,9 +411,11 @@ static void printInfo(Print& out) {
 // one status line with the peak level of each channel since the last UI update [dBFS]
 static void printLevels(Print& out) {
     char s[160];
-    int len = snprintf(s, sizeof(s), "%s %s drop:%lu ur:%lu |", modeName(g_mode),
+    int len = snprintf(s, sizeof(s), "%s %s drop:%lu ur:%lu pk:%lu pf:%lu ab:%lu |", modeName(g_mode),
                        g_running ? "RUN" : (usb_audio::streaming() ? "STREAM" : "IDLE"),
-                       (unsigned long)capture::droppedFrames(), (unsigned long)usb_audio::underruns());
+                       (unsigned long)capture::droppedFrames(), (unsigned long)usb_audio::underruns(),
+                       (unsigned long)usb_audio::packets(), (unsigned long)usb_audio::parityFixes(),
+                       (unsigned long)usb_audio::aborts());
     for (int c = 0; c < NUM_CH && len < (int)sizeof(s) - 8; c++) {
         float db = g_peak[c] > 1e-6f ? 20.0f * log10f(g_peak[c]) : -120.0f;
         len += snprintf(s + len, sizeof(s) - len, " %.0f", db < -99 ? -99.0f : db);
@@ -352,6 +426,9 @@ static void printLevels(Print& out) {
 // commands from the PC (one character, newline optional):
 //   s: SERIAL start   r: SD record start   d: debug UART start   u: USB AUDIO mode   x: stop
 //   i: info (JSON)    l: levels             g<dB>\n: gain
+//   R: ES7210 register dump + check against the written values
+//   C: why the last boot ended (reset reason + core dump summary of a crash)
+static void printCrashReport(Print& out);
 static void handleCommands(Stream& in) {
     static char line[24];
     static int len = 0;
@@ -382,6 +459,12 @@ static void handleCommands(Stream& in) {
         } else if (ch == 'l' && !(g_mode == OUT_MODE_SERIAL && g_running)) {
             printLevels(in);
             len = 0;
+        } else if (ch == 'R' && !(g_mode == OUT_MODE_SERIAL && g_running)) {
+            capture::dumpRegs();
+            len = 0;
+        } else if (ch == 'C' && !(g_mode == OUT_MODE_SERIAL && g_running)) {
+            printCrashReport(in);
+            len = 0;
         } else if (ch == '\n' || ch == '\r') {
             line[len] = 0;
             if (len > 1 && line[0] == 'g') capture::setGain(atof(line + 1));
@@ -402,35 +485,82 @@ static void handleSerialCommands() {
 }
 
 // ============================================================================ UI
-#if USE_M5UNIFIED  // ----- StampS3: one button + RGB LED
-static void drawUI() {
-    uint8_t r = 0, g = 0, b = 0;
-    bool blink = (millis() / 250) & 1;
-    switch (g_mode) {
-        case OUT_MODE_SD: g = 40; break;           // green
-        case OUT_MODE_SERIAL: b = 40; break;       // blue
-        case OUT_MODE_USB_AUDIO: r = 30; b = 30; break;  // purple
-        case OUT_MODE_DEBUG_UART: r = 20; g = 20; b = 20; break;  // white
-    }
-    bool act = g_running || (g_mode == OUT_MODE_USB_AUDIO && usb_audio::streaming());
-    if (act) { r = blink ? 80 : 0; }
-#ifdef SINGLE_ES7210
-    bool es_ok = capture::status().es_a;
-#else
-    bool es_ok = capture::status().es_a && capture::status().es_b;
-#endif
-    if (!es_ok) { r = 80; g = 20; b = 0; }  // orange: ES7210 NG
-    M5.Led.setAllColor(r, g, b);
-    M5.Led.display();
+#if USE_M5UNIFIED  // ----- StampS3: one button + RGB LED (WS2812 by FastLED)
+// (M5.Led does not drive the LED with Arduino 2.0.x / IDF 4.4, so FastLED is used)
+static CRGB g_led[1];
+static bool g_init_ok = false;
+
+static void setLed(CRGB c) {
+    g_led[0] = c;
+    FastLED.show();
 }
 
-static void handleInput() {
-    // click: start / stop    hold (1 s): next mode
-    if (M5.BtnA.wasHold()) {
-        if (!g_running) nextMode();
-    } else if (M5.BtnA.wasClicked()) {
+// yellow: I2C / ES7210 init in progress   red: capture init failed
+// blue: USB AUDIO mode (blinking while the host records)
+// green: SD mode / other modes (blinking while recording / running)
+static void drawUI() {
+    if (!g_init_ok) {
+        setLed(CRGB(40, 0, 0));
+        return;
+    }
+    bool act = g_running || (g_mode == OUT_MODE_USB_AUDIO && usb_audio::streaming());
+    bool blink = (millis() / 250) & 1;
+    CRGB on = (g_mode == OUT_MODE_USB_AUDIO) ? CRGB(0, 0, 40) : CRGB(0, 40, 0);
+    setLed((act && blink) ? CRGB::Black : on);
+}
+
+// long press: SD <-> USB AUDIO (from any other mode: SD). Stops a running recording first.
+static void toggleSdUsbAudio() {
+    uint8_t m = (g_mode == OUT_MODE_SD) ? OUT_MODE_USB_AUDIO : OUT_MODE_SD;
+    logf("long press: mode %s -> %s", modeName(g_mode), modeName(m));
+    setMode(m);
+    drawUI();
+}
+
+// OUT_MODE_SD: SD (WAV) recording start / stop.   OUT_MODE_USB_AUDIO: ignored (long press leaves it).
+// Other modes: UART DBG output on/off. Ignored while serial streaming (not interrupted by mistake).
+static void toggleRun() {
+    if (g_mode == OUT_MODE_USB_AUDIO) {
+        logf("short press ignored in USB AUDIO mode (long press: SD mode)");
+    } else if (g_mode == OUT_MODE_SD) {
         if (g_running) stopRun();
-        else if (g_mode != OUT_MODE_USB_AUDIO) startRun();
+        else startRun();  // logs "SD rec: start" or why it failed (mount / open)
+    } else if (g_mode == OUT_MODE_DEBUG_UART && g_running) {
+        stopRun();
+        logf("debug UART: off (button)");
+    } else if (!g_running) {
+        if (g_mode != OUT_MODE_DEBUG_UART) setMode(OUT_MODE_DEBUG_UART);
+        startRun();
+    }
+}
+
+// Main button (BtnA: G42 in M5Capsule, G0 on a bare StampS3) or PIN_DEBUG_SW to GND, handled as one button
+// (on a bare StampS3 both are G0, so one press must not toggle twice).
+// Short press (released before LONG_PRESS_MS): SD recording start / stop in OUT_MODE_SD,
+//   UART DBG start / stop in the other modes (ignored in USB AUDIO).
+// Long press (held LONG_PRESS_MS, acts while still held): SD <-> USB AUDIO.
+// SERIAL / UART DBG can also be selected with the serial commands.
+static void handleInput() {
+    static bool stable = false, last = false;  // true = pressed
+    static uint32_t changed_ms = 0, pressed_ms = 0;
+    static bool long_done = false;
+    bool now = M5.BtnA.isPressed() || digitalRead(PIN_DEBUG_SW) == LOW;
+    if (now != last) {
+        last = now;
+        changed_ms = millis();
+    }
+    if (now != stable && millis() - changed_ms >= 30) {  // debounce
+        stable = now;
+        if (stable) {
+            pressed_ms = millis();
+            long_done = false;
+        } else if (!long_done) {
+            toggleRun();  // short press: on release
+        }
+    }
+    if (stable && !long_done && millis() - pressed_ms >= LONG_PRESS_MS) {
+        long_done = true;
+        toggleSdUsbAudio();
     }
 }
 #else  // ----- Stamp-P4: no button / LED, serial commands only
@@ -439,14 +569,63 @@ static void handleInput() {}
 #endif
 
 // ============================================================================ setup / loop
+// ---- why the last boot ended. A panic goes to UART0 (G43) only, never to the USB CDC port, and
+// the CDC port is gone at the reset. The panic handler also writes a core dump to flash: read its
+// summary (task, PC, backtrace) at boot, keep it for the 'C' command and erase it.
+static char g_crash[480] = "";
+
+static const char* resetReasonName(esp_reset_reason_t r) {
+    switch (r) {
+        case ESP_RST_POWERON: return "power on";
+        case ESP_RST_EXT: return "external pin";
+        case ESP_RST_SW: return "software (esp_restart)";
+        case ESP_RST_PANIC: return "PANIC (exception / abort)";
+        case ESP_RST_INT_WDT: return "INTERRUPT WATCHDOG";
+        case ESP_RST_TASK_WDT: return "TASK WATCHDOG";
+        case ESP_RST_WDT: return "other watchdog";
+        case ESP_RST_DEEPSLEEP: return "deep sleep";
+        case ESP_RST_BROWNOUT: return "BROWNOUT (supply voltage)";
+        case ESP_RST_SDIO: return "SDIO";
+        default: return "unknown";
+    }
+}
+
+static void readCrashReport() {
+    esp_reset_reason_t r = esp_reset_reason();
+    int n = snprintf(g_crash, sizeof(g_crash), "last reset: %s (%d)", resetReasonName(r), (int)r);
+#if defined(MA8_BOARD_STAMPS3) && CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH && CONFIG_ESP_COREDUMP_DATA_FORMAT_ELF
+    if (esp_core_dump_image_check() == ESP_OK) {
+        static esp_core_dump_summary_t sum;
+        if (esp_core_dump_get_summary(&sum) == ESP_OK) {
+            n += snprintf(g_crash + n, sizeof(g_crash) - n,
+                          "\ncore dump: task '%s' PC 0x%08lx EXCCAUSE %lu EXCVADDR 0x%08lx\nBacktrace:",
+                          sum.exc_task, (unsigned long)sum.exc_pc, (unsigned long)sum.ex_info.exc_cause,
+                          (unsigned long)sum.ex_info.exc_vaddr);
+            for (uint32_t i = 0; i < sum.exc_bt_info.depth && i < 16 && n < (int)sizeof(g_crash) - 12; i++)
+                n += snprintf(g_crash + n, sizeof(g_crash) - n, " 0x%08lx", (unsigned long)sum.exc_bt_info.bt[i]);
+            if (sum.exc_bt_info.corrupted && n < (int)sizeof(g_crash) - 12)
+                n += snprintf(g_crash + n, sizeof(g_crash) - n, " |<-CORRUPTED");
+        }
+        esp_core_dump_image_erase();  // report each crash once
+    }
+#endif
+}
+
+static void printCrashReport(Print& out) { out.println(g_crash); }
+
 void setup() {
+    readCrashReport();
 #if USE_M5UNIFIED
     auto cfg = M5.config();
     cfg.internal_mic = false;  // I2S0/I2S1 are used by MA8
     cfg.internal_spk = false;
     cfg.internal_imu = false;
+    cfg.external_imu = false;  // Port A (G13/G15, I2C0) belongs to the ES7210s
+    cfg.external_rtc = false;
     M5.begin(cfg);
-    M5.BtnA.setHoldThresh(1000);
+    pinMode(PIN_DEBUG_SW, INPUT_PULLUP);
+    FastLED.addLeds<WS2812B, PIN_RGB_LED, GRB>(g_led, 1);
+    setLed(CRGB(40, 30, 0));  // yellow: initializing (capture::begin() repeats the I2C init until it succeeds)
 #endif
     Serial.begin(115200);
 #if defined(MA8_BOARD_STAMPP4)
@@ -455,7 +634,13 @@ void setup() {
     delay(300);
 
     logf("MA8: %d Hz, %d bit, %d ch, %d bytes/s", SAMPLE_RATE_HZ, SAMPLE_BITS, NUM_CH, BYTES_PER_SEC);
-    if (!capture::begin()) logf("capture init failed");
+    printCrashReport(Serial);  // (can be longer than a logf line)
+    bool cap_ok = capture::begin();
+    if (!cap_ok) logf("capture init failed");
+#if USE_M5UNIFIED
+    g_init_ok = cap_ok;
+    drawUI();  // green (red if the capture init failed)
+#endif
     const auto& st = capture::status();
 #ifdef SINGLE_ES7210
     logf("SINGLE_ES7210: ES7210 A only (CH1..4), I2S1 / ES7210 B not used");

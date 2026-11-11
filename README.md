@@ -7,7 +7,7 @@ ES7210（4ch オーディオADC）を2個使い、**8ch を同時サンプリン
 | **SD** | microSD に 8ch WAV で保存（`/MA8/R0001_00.WAV` …） |
 | **SERIAL** | USB-CDC でバイナリパケットを送信。PC側は [tools/ma8_serial_rx.py](tools/ma8_serial_rx.py) で受信して WAV に保存 |
 | **USB AUDIO** | 8ch マイクとして認識される（Windows/macOS/Linux 標準ドライバ、Audacity などで録音）。StampS3 は UAC1（Full-Speed）、Stamp-P4 は UAC2（High-Speed） |
-| **UART DBG** | デバッグ用。4ch を約 1kHz に間引き、テキスト（CSV）でハードウェア UART へ出力（921600bps） |
+| **UART DBG** | デバッグ用。全チャンネルを間引いて（4ch: 約 1kHz、8ch: 約 500Hz）、テキスト（CSV）で USB シリアル（ログと同じポート）へ出力。`UART_G43` を定義するとハードウェア UART（921600bps）へ |
 
 対応モジュールは2種類です。
 
@@ -65,6 +65,7 @@ pio device monitor
 
 - ESP32 の I2S は、TDM モードでは 1 ポートあたりデータ入力が 1 本しかありません。そこで **I2S0 をマスター**（MCLK/BCLK/LRCK を出力し、ES7210 A のデータを受信）、**I2S1 をスレーブ**（I2S0 と同じ BCLK/LRCK パッドを GPIO マトリクスで入力に引き込み、ES7210 B のデータを受信）にしています。
 - 2個の ES7210 は同じ MCLK/SCLK/LRCK で動くため、**サンプリングの瞬間は完全に同期**します。
+- ES7210 に渡す LRCK は、GPIO マトリクスで**極性を反転**しています（`ES7210_LRCK_INVERT 1`）。I2S1 は入力側で反転し戻すので、I2S0 と I2S1 のタイミングは揃ったままです。この設定と、スロットの並べ替え `ES7210_SLOT_OF_MIC {0,2,1,3}` の組み合わせで、CH1..4 = A の MIC1..4、CH5..8 = B の MIC1..4 になります（実機で確認済み）。
 - 起動時に I2S1 → I2S0 の順で開始し、2つのポートが同じフレームから取り込みを始めるようにしています（詳細と確認方法は「4. 同期の確認」を参照）。
 - ES7210 は I2C スレーブとして設定します（TDM、I2S フォーマット）。MCLK は通常 256·Fs です。Stamp-P4 で 24/32bit（スロット 32bit）のときだけ 512·Fs にします（IDF 5 の TDM ドライバは MCLK/BCLK が 2 以下だと MCLK 倍率を自動で変えるため、ES7210 の設定とずれないように先に合わせています）。
 
@@ -80,6 +81,7 @@ pio device monitor
 | SDA | 双方向 | 3 CDATA | **G26** | **G13** (Grove) |
 | SCL | ESP → A, B | 4 CCLK | **G27** | **G15** (Grove) |
 | UART DBG TX | ESP → PC | — | **G37** | **G43** |
+| UART DBG スイッチ | SW → ESP（押すと GND） | — | — | **G0** |
 | 3.3V | 電源 | VDDP/VDDD/VDDA/VDDM | 3V3 | 3V3 |
 | GND | | GNDD/GNDA/PGND | GND | GND |
 | microSD | | — | 外付け SDMMC 4bit：CLK=**G12**, CMD=**G10**, D0=**G8**, D1=**G1**, D2=**G21**, D3=**G23** | M5Capsule 内蔵スロット（CS=G11, SCK=G14, MOSI=G12, MISO=G39） |
@@ -130,16 +132,19 @@ pio device monitor
 |---|---|---|
 | `SAMPLE_RATE_HZ` | 32000 | 8000〜48000 |
 | `SAMPLE_BITS` | 16 | 16 / 24（3バイトに詰める）/ 32 |
-| `DEFAULT_OUT_MODE` | `OUT_MODE_SD` | 起動時のモード |
+| `DEFAULT_OUT_MODE` | StampS3: `OUT_MODE_USB_AUDIO` / Stamp-P4: `OUT_MODE_SD` | 起動時のモード |
 | `MIC_GAIN_DB` | 30 | PGA ゲイン 0〜37.5dB |
 | `MIC_BIAS_MV` | 2870 | MICBIAS 電圧 |
 | `FILE_SPLIT_SEC` | 600 | WAV ファイルを分割する間隔（秒） |
 | `SD_MMC_KHZ` | 20000 | Stamp-P4 の SD クロック（SDMMC 4bit） |
 | `SERIAL_USE_RAW_EP` | S3: 1 / P4: 0 | 1: CDC のバルク IN エンドポイントへ直接転送（S3 用の高速化）／0: Serial.write（P4 は HS なのでこれで十分） |
-| `DEBUG_RATE_HZ` | 1000 | UART DBG の出力レート。ES7210 は `SAMPLE_RATE_HZ`（8kHz 以上）で動かし、`SAMPLE_RATE_HZ / DEBUG_RATE_HZ` 個ごとに 1 行出す |
-| `DEBUG_AVERAGE` | 1 | 1: 間引く区間の平均を出す／0: N 個ごとに 1 サンプルを取り出す |
-| `DEBUG_CH_FIRST` | 0 | UART DBG で出す 4ch の先頭（0: CH1-4、4: CH5-8） |
-| `DEBUG_UART_BAUD` | 921600 | UART DBG の通信速度（TX ピンは `PIN_DEBUG_UART_TX`：P4 は G37、S3 は G43） |
+| `DEBUG_CH` | `NUM_CH` | UART DBG で 1 行に出すチャンネル数（8ch ビルドでは 8。4 にすると `DEBUG_CH_FIRST` から 4ch） |
+| `DEBUG_RATE_HZ` | 4ch: 1000 / 8ch: 500 | UART DBG の出力レート。ES7210 は `SAMPLE_RATE_HZ`（8kHz 以上）で動かし、`SAMPLE_RATE_HZ / DEBUG_RATE_HZ` 個ごとに 1 行出す。通信速度に収まらない設定はビルドエラーになる |
+| `DEBUG_AVERAGE` | 1 | 1: 間引く区間の平均／0: N 個ごとに 1 サンプル／2: 区間のピーク（絶対値の最大。マイクが反応しているかを見るのに便利） |
+| `DEBUG_CH_FIRST` | 0 | `DEBUG_CH` を 4 にしたときの先頭（0: CH1-4、4: CH5-8） |
+| `OUT_MODE_DEBUG_UART_PEAK` | 未定義 | 定義すると UART DBG は、`DEBUG_PEAK_MS`（500ms）ごとに各チャンネルのその区間の振幅（最大値 − 最小値）を 1 行で出す（`CH1pp,CH2pp,...`）。`DEBUG_RATE_HZ` と `DEBUG_AVERAGE` は使わない |
+| `UART_G43` | 未定義 | 未定義: UART DBG を USB シリアル（ログと同じポート）へ出す／定義: ハードウェア UART（TX ピンは `PIN_DEBUG_UART_TX`：S3 は G43、P4 は G37）へ出す |
+| `DEBUG_UART_BAUD` | 921600 | `UART_G43` のときの UART DBG の通信速度 |
 | `SINGLE_ES7210` | 未定義 | 定義すると ES7210 A だけを使う 4ch のテスト用ビルド（I2S1・ES7210 B は使わない） |
 
 データレートは `Fs × 8ch × バイト数` です（32kHz/16bit で 512 kB/s、48kHz/16bit で 768 kB/s、48kHz/24bit で 1152 kB/s）。
@@ -167,17 +172,24 @@ pio device monitor
 | `d` | UART DBG モードに切り替えて出力開始 |
 | `x` | 停止 |
 | `i` | 情報を JSON で返す（停止中のみ） |
-| `l` | 各チャンネルのピークレベル（dBFS）、ドロップ数、アンダーラン数を1行で返す |
+| `l` | モード・状態と、各チャンネルのピークレベル（dBFS）を1行で返す。`drop`: リングバッファがあふれて捨てたフレーム数、`ur`: USB Audio で送るデータが足りなかったパケット数、`pk`: USB Audio で送ったパケット数（1 秒に約 1000 増えれば正常）、`pf`: 送信フレームを合わせ直した回数、`ab`: PC が録音を止めたときに取り消したパケット数 |
+| `R` | ES7210 A/B のレジスタ REG00〜4F を16進で表示し、MA8 が書き込んだ値と照合する（違う値には `*` を付け、最後に `all written registers ok` または `MISMATCH` を表示）。SERIAL で送信している間は無視する |
+| `C` | 前回の起動がどう終わったか（リセット要因）を表示する。クラッシュで再起動した場合は、フラッシュに残ったコアダンプから、落ちたタスク名・PC・バックトレースも表示する（StampS3。起動ログにも出る）。割り込みウォッチドッグなどコアダンプが残らない場合は、G43（UART0、115200 baud）に出るパニック出力を見る。SERIAL で送信している間は無視する |
 | `g24` + 改行 | ゲインを 24dB に設定 |
 
-**StampS3 のボタン**: ボタン（M5Unified の BtnA。M5Capsule では G42）でも操作できます。
+**StampS3 のボタン／G0 スイッチ**: 本体ボタン（M5Unified の BtnA。M5Capsule では G42、StampS3 単体では G0）を押すか、G0 を GND に落としたときの動作です。
+- **長押し（`LONG_PRESS_MS` = 1 秒）**：**SD 記録モードと USB AUDIO モードを切り替え** ます。1 秒たった時点で、離す前に切り替わります。SD 録音中なら、録音を止めて保存してから切り替えます。SD／USB AUDIO 以外のモードから長押しすると、SD モードになります。
+- **短押し**（離したときに動作）は、モードによって次のように動きます。
+- **OUT_MODE_SD のとき**：**SD への WAV 録音が開始／停止** します。USB シリアルに開始・停止のメッセージが出ます（`SD rec: start -> /MA8/R0001_00.WAV ...`、`SD rec: stop, 12.3 s, 1 files, dropped 0 frames`）。マイクの振幅は出しません。SD のマウントやファイル作成に失敗すると、`SD mount failed` などを表示します。
+- **USB AUDIO モードのとき**：何もしません（誤ってモードを抜けないため）。
+- **それ以外のモードのとき**：**UART DBG の出力が開始／停止** します。停止中に押すと、UART DBG モードに切り替えて出力を始めます。SERIAL で送信している間は、誤って止めないように無視します。
+- 2つは1つのボタンとして扱います（30ms のチャタリング除去）。StampS3 単体では本体ボタンも G0 なので、1回押しても2回切り替わることはありません。
+- SERIAL／UART DBG モードは、USB シリアルのコマンドでも選べます。
+- G0 は内部プルアップです。BOOT ストラップでもあるので、**押したままリセットや電源投入をすると書き込みモードで起動します。**
 
-| 操作 | 動作 |
-|---|---|
-| クリック | 開始／停止 |
-| 1秒長押し | モード切替（SD → SERIAL → USB AUDIO → UART DBG） |
+LED（本体の WS2812、FastLED で点灯）: **黄 = I2C（ES7210）を初期化中**、**緑 = SD 記録モード**（UART DBG／SERIAL モードも緑）、緑の点滅 = SD 録音中（または UART DBG／SERIAL の出力中）、**青 = USB AUDIO モード**、青の点滅 = PC が USB AUDIO を録音中、赤 = I2S の初期化に失敗
 
-LED の色: 緑 = SD、青 = SERIAL、紫 = USB AUDIO、白 = UART DBG、赤の点滅 = 動作中、橙 = ES7210 が見つからない
+**I2C の初期化**: 起動時に ES7210 の設定手順を 1 ステップずつ USB シリアルへログ出力します（probe、reset、HPF、clock、TDM format … と、設定したレジスタを読み戻して確認する verify）。応答がないときはバス上のアドレスを一覧で出します。失敗したら `I2C_RETRY_MS`（1 秒）ごとに I2C バスを開き直し、成功するまで繰り返します（その間 LED は黄のまま）。
 
 **SERIAL モード（PC側）**
 
@@ -188,7 +200,11 @@ python tools/ma8_serial_rx.py COM5 -t 10 -o rec.wav
 
 Stamp-P4 では、USB HS 側の CDC の COM ポートを指定してください（基板の USB-C 側ではありません）。
 
-**UART DBG モード**: ES7210 の動作確認用です。USB-UART 変換器の RX を TX ピン（P4: G37、S3: G43）につなぎ（GND も共通に）、921600bps で開きます。開始すると最初にラベル行 `CH1,CH2,CH3,CH4` を出し、その後は 1 行ごとに 4ch の値（SAMPLE_BITS 単位の符号付き整数）を出します。Arduino IDE のシリアルプロッタなどでそのまま波形を見られます。ES7210 は 8kHz 未満では動かないため、サンプリングは `SAMPLE_RATE_HZ` のまま行い、出力だけを間引いています。
+**UART DBG モード**: ES7210 の動作確認用です。出力先は次のとおりです。
+- 既定（`UART_G43` 未定義）: 初期化ログと同じ USB シリアルに出します（Stamp-P4 では HS 側 CDC と基板の USB-C の両方）。`pio device monitor` でそのまま見られます。ログの行が混ざることがあります。
+- `UART_G43` を定義したとき: USB-UART 変換器の RX を TX ピン（S3: G43、P4: G37）につなぎ（GND も共通に）、921600bps で開きます。
+
+開始すると、最初にラベル行（`CH1,CH2,...,CH8`、4ch ビルドでは `CH1,...,CH4`）を出し、その後は 1 行ごとに全チャンネルの値（SAMPLE_BITS 単位の整数）を出します。8ch で見るときは config.h の `#define SINGLE_ES7210` をコメントアウトしてください。Arduino IDE のシリアルプロッタなどでそのまま波形を見られます。ES7210 は 8kHz 未満では動かないため、サンプリングは `SAMPLE_RATE_HZ` のまま行い、出力だけを間引いています。
 
 **USB AUDIO モード**: 「MA8 8ch Microphone」（`SINGLE_ES7210` のときは 4ch）として認識されます。録音アプリが入力を開いている間だけデータを流します。
 

@@ -1,11 +1,22 @@
 # MA8 引き継ぎメモ（VSCode の Claude 向け）
 
-作成日: 2026-10-20 / 更新: 2026-10-28（Stamp-P4 対応、CoreS3 削除）
+作成日: 2026-10-20 / 更新: 2026-11-04（UART DBG の 8ch 出力、PC 移行）
+
+> 別の PC で作業を続けるときは、このファイルと README.md を読めば前提がわかるようにしてある。Claude Code のチャット履歴（`~/.claude/projects/.../*.jsonl`）は個人情報を含むので、公開リポジトリには置いていない。
+
+## 0. 直近の作業（2026-11-04）
+
+- UART DBG（`OUT_MODE_DEBUG_UART`）を全チャンネル出力にした。`DEBUG_CH`（既定 `NUM_CH`）、8ch では `DEBUG_RATE_HZ` 500（4ch は 1000）。
+  - 通信速度（921600bps）に収まらない組み合わせは `static_assert` でビルドエラーにしている。
+  - `DEBUG_AVERAGE 2` でピーク（|x| の最大）を出す。平均だと音声の交流成分が消えるので、マイクが反応しているかを見るならピークがよい。
+  - StampS3 の 8ch（16/32bit）でビルドが通ることを確認済み。実機では未確認。
+- 8ch で使うには config.h の `#define SINGLE_ES7210` をコメントアウトする（現在は定義したまま）。
+- 次にやること: 8ch の UART DBG で MIC1〜4（ES7210 B も）を1本ずつつなぎ、チャンネル対応表を取る（§2 の未解決事項）。
 
 ## 1. 目的
 
 - ES7210（4ch ADC）×2 で 8ch 同時サンプリングを行う装置を作る。
-- 出力は4モード：SD（WAV）、USB シリアル（バイナリ）、USB オーディオ（UAC）、デバッグ UART（約1kHz の CSV）。
+- 出力は4モード：SD（WAV）、USB シリアル（バイナリ）、USB オーディオ（UAC）、デバッグ UART（4ch は約 1kHz、8ch は約 500Hz の CSV）。
 - PlatformIO を使う。サンプリングレートとビット数は `#define`（`include/config.h`）で設定する。
 - 対象ボード：
   - **M5Stack Stamp-P4（ESP32-P4）＝本命**。USB HS + UAC2 で 8ch/48kHz/24bit を USB Audio で出すため。
@@ -22,7 +33,10 @@
 | Stamp-P4 ファームウェア | 作成済み。**実機では未テスト**。PlatformIO でビルド通過（4ch/8ch、16/24/32bit、48kHz、rev<3 / rev3） |
 | PC 受信スクリプト | `tools/ma8_serial_rx.py`。合成データでパーサと同期チェックを確認済み。4ch パケットにも対応 |
 
-**未解決: チャンネル対応**。StampS3 で MIC1 だけつなぐと CH3 が振れる（CH1/2/4 は 0）。MIC2〜4 も順につないで 4×4 の対応表を取る必要がある。2スロット回転（MIC1→CH3, MIC2→CH4, MIC3→CH1, MIC4→CH2）なら LRCK のフレーム先頭が半フレームずれている（CH1/2 と CH3/4 が別フレーム）ので、ES7210 REG11 の LRCK 極性か ESP 側の WS 極性で直す。それ以外の並びなら、ES7210 自体のスロット順としてソフトで並べ替える。
+**チャンネル対応（2026-11 にソフトで対応済み）**: 8ch で 1 本ずつ測った結果、1 チップ内の受信スロット順は slot0=MIC2, slot1=MIC4, slot2=MIC1, slot3=MIC3（MIC3 は推定）だった。config.h の `ES7210_SLOT_OF_MIC {2,0,3,1}` で並べ替え、CH1..4 = A MIC1..4、CH5..8 = B MIC1..4 にしている（A/B が入れ替わって見えたのは DIN_A/DIN_B の配線ミス）。半フレームずれ（LRCK 極性）が原因なら、MIC1/3 と MIC2/4 の間に 1 サンプルの時間ずれが残る可能性がある。
+→ `ES7210_LRCK_INVERT`（既定 1）を追加した。ESP の GPIO マトリクスでパッドへの LRCK 出力を反転し、8ch では I2S1 の入力側も反転し戻す（ES7210 から見た LRCK だけが反転する）。反転時の表は `{0,2,1,3}`。**実機で CH1..4 = MIC1..4 になることを確認済みで、この仕様（LRCK 反転 + `{0,2,1,3}`）で確定**（2026-11-10）。以下は当初のメモ。
+
+（旧）**未解決: チャンネル対応**。StampS3 で MIC1 だけつなぐと CH3 が振れる（CH1/2/4 は 0）。MIC2〜4 も順につないで 4×4 の対応表を取る必要がある。2スロット回転（MIC1→CH3, MIC2→CH4, MIC3→CH1, MIC4→CH2）なら LRCK のフレーム先頭が半フレームずれている（CH1/2 と CH3/4 が別フレーム）ので、ES7210 REG11 の LRCK 極性か ESP 側の WS 極性で直す。それ以外の並びなら、ES7210 自体のスロット順としてソフトで並べ替える。
 
 ## 3. ビルド環境（重要）
 
@@ -31,6 +45,7 @@
   - `core_dir = ~/.platformio-pioarduino` で隔離している。pioarduino は core の penv に自前の PlatformIO フォーク（`pioarduino` パッケージ）を上書きインストールし、`toolchain-*` などの `@` 付きディレクトリを削除するため、通常の `~/.platformio` で使うと他プロジェクトを壊す（実際に一度壊して復旧した）。
   - pioarduino はコマンドを PowerShell / cmd から実行すること。Git Bash（MSYS）からだと `idf_tools.py` が「MSys/Mingw is not supported」で失敗する。
   - 公式の Stamp-P4 手順（pioarduino 54.03.21）は esptool 5.0.0-dev1 が click 8.3 と非互換でビルドできない。
+- 新しい PC では、PlatformIO（VSCode 拡張）を入れて `pio run -e m5stamps3` を実行すれば espressif32@6.13.0 が入る。`pio run -d p4` を初めて実行すると、pioarduino 一式が `~/.platformio-pioarduino` に入る（PowerShell から実行すること）。
 - ソース切り替え: `build_src_filter` で `src/s3/` と `src/p4/` を切り替える。共通は main.cpp、es7210、serial_stream、wav_writer、ringbuf。
 
 ## 4. 設計の要点（理由つき）

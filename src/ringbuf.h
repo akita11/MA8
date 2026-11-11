@@ -1,7 +1,8 @@
 #pragma once
 // Single-producer / single-consumer lock-free ring buffer of fixed-size frames.
 //   producer : capture task (core 0)
-//   consumer : SD / serial writer (loop task) or USB audio (TinyUSB task) - only one at a time
+//   consumer : SD / serial writer (loop task) or USB audio (StampS3: USB interrupt, Stamp-P4:
+//              TinyUSB task) - only one at a time
 // discard() is a consumer-side operation (drops everything that is currently stored).
 
 #include <atomic>

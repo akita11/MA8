@@ -27,7 +27,7 @@
 
 // Test build with only ES7210 A (I2S0 master, CH1..4). I2S1 and ES7210 B are not used.
 // (can also be given with -DSINGLE_ES7210 in platformio.ini)
-#define SINGLE_ES7210
+//#define SINGLE_ES7210
 
 #ifdef SINGLE_ES7210
 #define NUM_CH              4           // ES7210 A = CH1..4
@@ -39,19 +39,55 @@
 #define OUT_MODE_SD         0           // record to microSD as WAV
 #define OUT_MODE_SERIAL     1           // stream binary packets over USB CDC
 #define OUT_MODE_USB_AUDIO  2           // USB Audio microphone (StampS3: UAC1 FS, Stamp-P4: UAC2 HS)
-#define OUT_MODE_DEBUG_UART 3           // debug: 4ch decimated to ~1 kHz, text (CSV) on a hardware UART
+#define OUT_MODE_DEBUG_UART 3           // debug: all ch decimated to ~1 kHz (8ch: 500 Hz), text (CSV) on a hardware UART
 #define NUM_OUT_MODES       4
 
-#define DEFAULT_OUT_MODE OUT_MODE_DEBUG_UART // default output mode at boot (can be changed by button / touch)
+//#define DEFAULT_OUT_MODE OUT_MODE_DEBUG_UART // default output mode at boot (can be changed by button / touch)
 
 #ifndef DEFAULT_OUT_MODE
+#if defined(MA8_BOARD_STAMPS3)
+#define DEFAULT_OUT_MODE    OUT_MODE_USB_AUDIO  // mode at boot (G0 long press: USB Audio <-> SD)
+#else
 #define DEFAULT_OUT_MODE    OUT_MODE_SD // mode at boot (can be changed by button / touch)
+#endif
 #endif
 
 // ------------------------------------------------------------------ ES7210 analog
 #define ES7210_ADDR_A       0x40        // AD1=L, AD0=L -> CH1..CH4  (I2S0, master)
 #define ES7210_ADDR_B       0x41        // AD1=L, AD0=H -> CH5..CH8  (I2S1, slave; unused with SINGLE_ES7210)
-#define I2C_FREQ_HZ         400000
+// ---- output channel order (measured on the StampS3, 8ch build, 2026-11)
+// One mic at a time gave: A MIC1 -> CH7, A MIC2 -> CH5, B MIC1 -> CH3, B MIC4 -> CH2 (before this mapping)
+//  * TDM slot order inside one ES7210 frame as received: slot0 = MIC2, slot1 = MIC4, slot2 = MIC1, slot3 = MIC3
+//    (MIC3 -> slot3 is inferred, not measured). ES7210_SLOT_OF_MIC[k] = slot that carries MIC(k+1).
+//    (A and B were also swapped in that test: a wiring mistake of DIN_A / DIN_B, not handled here)
+// With this mapping: CH1..4 = A MIC1..4 (I2S0 / DIN_A), CH5..8 = B MIC1..4 (I2S1 / DIN_B)
+// ---- LRCK polarity seen by the ES7210s (inverted in the ESP GPIO matrix; I2S0/I2S1 timing unchanged)
+//  0: as the I2S driver outputs it (the measurement above)
+//  1: inverted (fixed spec, verified on hardware 2026-11). The ES7210 sends MIC1/MIC3 in one LRCK half
+//     and MIC2/MIC4 in the other; with the inverted LRCK the received order is MIC1, MIC3, MIC2, MIC4
+//     and there is no 1-sample skew between the MIC1/3 and MIC2/4 pairs.
+#ifndef ES7210_LRCK_INVERT
+#define ES7210_LRCK_INVERT  1
+#endif
+#ifndef ES7210_SLOT_OF_MIC
+#if ES7210_LRCK_INVERT
+#define ES7210_SLOT_OF_MIC  {0, 2, 1, 3}    // measured: CH1..4 = MIC1..4
+#else
+#define ES7210_SLOT_OF_MIC  {2, 0, 3, 1}    // measured
+#endif
+#endif
+
+#define I2C_FREQ_HZ       100000      // 100 kHz: margin for long wires / weak pull-ups
+// StampS3 I2C driver for the ES7210s
+//   0: Arduino Wire (ESP-IDF driver): SCL/SDA glitch filter on, I2C_GLITCH_FILTER_CYC cycles
+//   1: M5.Ex_I2C (M5Unified / M5GFX): glitch filter threshold 0 = spikes on SCL/SDA are not filtered
+// (Stamp-P4 always uses Wire)
+#ifndef I2C_USE_M5_EX_I2C
+#define I2C_USE_M5_EX_I2C   0
+#endif
+#define I2C_GLITCH_FILTER_CYC 7         // ignore SCL/SDA pulses shorter than this many I2C source clocks (0..7)
+#define I2C_WRITE_TRIES     5           // each ES7210 register write is tried up to this many times
+#define I2C_RETRY_MS        1000        // ES7210 I2C init is repeated at this interval until it succeeds
 
 // PGA gain [dB]: 0,3,6,...,33, 34.5, 36, 37.5  (nearest step is used)
 #define MIC_GAIN_DB         30.0f
@@ -81,7 +117,8 @@
 #define PIN_SD_MISO         39
 #define PIN_DEBUG_UART_TX   43          // U0TXD pad
 #define PIN_RGB_LED         21          // internal WS2812 (status)
-#define USE_M5UNIFIED       1           // button + LED via M5Unified, ES7210 on M5.Ex_I2C
+#define PIN_DEBUG_SW        0           // switch to GND: UART DBG output on/off (G0 = BOOT strap, internal pull-up)
+#define USE_M5UNIFIED       1           // button via M5Unified, LED via FastLED, ES7210 on M5.Ex_I2C
 
 #elif defined(MA8_BOARD_STAMPP4)
 // ---- M5Stack Stamp-P4 : external signals only on the 2.54mm DIP pins
@@ -143,15 +180,34 @@
 
 // ------------------------------------------------------------------ debug UART (OUT_MODE_DEBUG_UART)
 // ES7210 runs at SAMPLE_RATE_HZ (>= 8 kHz); the output is decimated by DEBUG_DECIM to ~DEBUG_RATE_HZ.
-// One line per output frame: "v1,v2,v3,v4\n" (signed integers in SAMPLE_BITS units).
+// One line per output frame: "v1,v2,...\n" (DEBUG_CH signed integers in SAMPLE_BITS units).
+#ifndef DEBUG_CH
+#define DEBUG_CH            NUM_CH              // channels per line: all (8 in an 8ch build), or 4 with DEBUG_CH_FIRST
+#endif
+#ifndef DEBUG_RATE_HZ
+#if DEBUG_CH > 4
+#define DEBUG_RATE_HZ       500                 // 8ch: keep the text within the UART bandwidth (also at 32bit)
+#else
 #define DEBUG_RATE_HZ       1000
-#define DEBUG_AVERAGE       1                   // 1: mean of DEBUG_DECIM samples, 0: every DEBUG_DECIM-th sample
-#define DEBUG_CH_FIRST      0                   // output CH(DEBUG_CH_FIRST+1)..+4 (4: ES7210 B in an 8ch build)
+#endif
+#endif
+#define DEBUG_AVERAGE       1                   // 0: every DEBUG_DECIM-th sample, 1: mean of DEBUG_DECIM samples,
+                                                // 2: peak |x| of DEBUG_DECIM samples (mic level check)
+#define DEBUG_CH_FIRST      0                   // first output channel - 1 (4 with DEBUG_CH 4: ES7210 B only)
+// Defined: instead of the decimated values, one line "pp1,pp2,..." every DEBUG_PEAK_MS
+// (amplitude = maximum - minimum of each channel in that interval; DEBUG_RATE_HZ / DEBUG_AVERAGE are not used)
+#define OUT_MODE_DEBUG_UART_PEAK
+#define DEBUG_PEAK_MS       500
+// Output of OUT_MODE_DEBUG_UART:
+//   UART_G43 defined     : hardware UART1, TX = PIN_DEBUG_UART_TX (StampS3: G43, Stamp-P4: G37), DEBUG_UART_BAUD
+//   UART_G43 not defined : USB serial (CDC), the same port as the log messages
+//#define UART_G43
 #define DEBUG_UART_BAUD     921600
 #define PIN_DEBUG_UART_RX   -1                  // UART1 RX: not used
 
 // ------------------------------------------------------------------ UI
 #define UI_UPDATE_MS        200
+#define LONG_PRESS_MS       1000                // StampS3 button / G0: long press = SD <-> USB AUDIO mode
 
 // =====================================================================================
 // Derived values (do not edit)
@@ -219,8 +275,17 @@
 static_assert(SAMPLE_RATE_HZ >= 8000 && SAMPLE_RATE_HZ <= 48000, "ES7210 single speed: 8k..48kHz");
 #define SD_WRITE_CHUNK      (SD_WRITE_FRAMES * FRAME_BYTES)
 
-#define DEBUG_CH            4
+#ifdef OUT_MODE_DEBUG_UART_PEAK
+#define DEBUG_DECIM         (SAMPLE_RATE_HZ * DEBUG_PEAK_MS / 1000)    // frames per max/min line
+#else
 #define DEBUG_DECIM         ((SAMPLE_RATE_HZ + DEBUG_RATE_HZ / 2) / DEBUG_RATE_HZ)
+#endif
 static_assert(DEBUG_DECIM >= 1, "DEBUG_RATE_HZ too high");
+// worst-case line: "-32768," (16bit) / "-8388608," (24bit) / "-2147483648," (32bit) per channel, 10 bits per byte
+#define DEBUG_VALUE_CHARS   (SAMPLE_BITS == 16 ? 7 : SAMPLE_BITS == 24 ? 9 : 12)
+#ifdef UART_G43
+static_assert(1ULL * DEBUG_CH * DEBUG_VALUE_CHARS * 10 * SAMPLE_RATE_HZ / DEBUG_DECIM <= DEBUG_UART_BAUD,
+              "debug UART: DEBUG_RATE_HZ too high for DEBUG_CH / SAMPLE_BITS / DEBUG_UART_BAUD");
+#endif
 static_assert(DEBUG_CH_FIRST + DEBUG_CH <= NUM_CH, "DEBUG_CH_FIRST out of range");
 static_assert(I2S_DMA_FRAMES * 4 * (SLOT_BITS / 8) <= 4092, "I2S DMA buffer too large");
